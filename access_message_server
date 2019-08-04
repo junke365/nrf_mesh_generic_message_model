@@ -1,0 +1,356 @@
+/* Copyright (c) 2010 - 2018, Nordic Semiconductor ASA
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without modification,
+ * are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form, except as embedded into a Nordic
+ *    Semiconductor ASA integrated circuit in a product or a software update for
+ *    such product, must reproduce the above copyright notice, this list of
+ *    conditions and the following disclaimer in the documentation and/or other
+ *    materials provided with the distribution.
+ *
+ * 3. Neither the name of Nordic Semiconductor ASA nor the names of its
+ *    contributors may be used to endorse or promote products derived from this
+ *    software without specific prior written permission.
+ *
+ * 4. This software, with or without modification, must only be used with a
+ *    Nordic Semiconductor ASA integrated circuit.
+ *
+ * 5. Any software provided in binary form under this license must not be reverse
+ *    engineered, decompiled, modified and/or disassembled.
+ *
+ * THIS SOFTWARE IS PROVIDED BY NORDIC SEMICONDUCTOR ASA "AS IS" AND ANY EXPRESS
+ * OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY, NONINFRINGEMENT, AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL NORDIC SEMICONDUCTOR ASA OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+ * GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+ * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include <stdint.h>
+#include <string.h>
+
+/* HAL */
+#include "boards.h"
+#include "simple_hal.h"
+#include "app_timer.h"
+
+/* Core */
+#include "nrf_mesh_config_core.h"
+#include "nrf_mesh_gatt.h"
+#include "nrf_mesh_configure.h"
+#include "nrf_mesh.h"
+#include "mesh_stack.h"
+#include "device_state_manager.h"
+#include "access_config.h"
+
+/* Provisioning and configuration */
+#include "mesh_provisionee.h"
+#include "mesh_app_utils.h"
+
+/* Models */
+#include "access.h"
+#include "access_reliable.h"
+
+/* Logging and RTT */
+#include "log.h"
+#include "rtt_input.h"
+
+/* Example specific includes */
+#include "app_config.h"
+#include "nrf_mesh_config_examples.h"
+#include "light_switch_example_common.h"
+#include "example_common.h"
+#include "ble_softdevice_support.h"
+
+#include "nrf_delay.h"
+
+#define APP_STATE_OFF                (0)
+#define APP_STATE_ON                 (1)
+
+#define APP_UNACK_MSG_REPEAT_COUNT   (2)
+
+static bool                   m_device_provisioned;
+uint16_t mdl_hndl;
+
+// Provisioning =============================================================================
+static void device_identification_start_cb(uint8_t attention_duration_s)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Called: device_identification_start_cb\n");
+    hal_led_mask_set(LEDS_MASK, false);
+    hal_led_blink_ms(BSP_LED_2_MASK  | BSP_LED_3_MASK,
+                     LED_BLINK_ATTENTION_INTERVAL_MS,
+                     LED_BLINK_ATTENTION_COUNT(attention_duration_s));
+}
+
+static void provisioning_aborted_cb(void)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Called: provisioning_aborted_cb\n");
+    hal_led_blink_stop();
+}
+
+static void provisioning_complete_cb(void)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Called: provisioning_complete_cb\n");
+
+#if MESH_FEATURE_GATT_ENABLED
+    /* Restores the application parameters after switching from the Provisioning
+     * service to the Proxy  */
+    gap_params_init();
+    conn_params_init();
+#endif
+
+    dsm_local_unicast_address_t node_address;
+    dsm_local_unicast_addresses_get(&node_address);
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Node Address: 0x%04x \n", node_address.address_start);
+
+    hal_led_blink_stop();
+    hal_led_mask_set(LEDS_MASK, LED_MASK_STATE_OFF);
+    hal_led_blink_ms(LEDS_MASK, LED_BLINK_INTERVAL_MS, LED_BLINK_CNT_PROV);
+}
+
+// ======================================================================================
+
+static void node_reset(void)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "----- Node reset  -----\n");
+    hal_led_blink_ms(LEDS_MASK, LED_BLINK_INTERVAL_MS, LED_BLINK_CNT_RESET);
+    /* This function may return if there are ongoing flash operations. */
+    mesh_stack_device_reset();
+}
+
+static void config_server_evt_cb(const config_server_evt_t * p_evt)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Called: config_server_evt_cb with Event:%d\n", p_evt->type);
+    if (p_evt->type == CONFIG_SERVER_EVT_NODE_RESET)
+    {
+        node_reset();
+    }
+}
+
+static void my_status_cb(access_model_handle_t model_handle, void * p_args, access_reliable_status_t status)
+{
+  __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Called my_status_cb [Handle:%04X] [Status:%d]\n", model_handle, status);
+
+  nrf_gpio_pin_write(LED_1, true);
+  if(status == 0)   // If the Transmission was successful turn LED 2 of, Else turn LED 2 on
+  {
+    nrf_gpio_pin_write(LED_2, true);
+  }
+  else
+  {
+    nrf_gpio_pin_write(LED_2, false);
+  }
+}
+
+static void button_event_handler(uint32_t button_number)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Button %u pressed\n", button_number);
+
+    uint8_t data[] = {0xFF};
+
+    uint32_t status;
+
+    switch (button_number)  // Depending on the Button Number change the sent data
+    {
+        case 0:
+        {
+            data[0] = NRF_GPIO_PIN_MAP(0,13);
+            break;
+        }
+        case 1:
+        {
+            data[0] = NRF_GPIO_PIN_MAP(0,14);
+            break;
+        }
+        case 2:
+        {
+            data[0] = NRF_GPIO_PIN_MAP(0,15);
+            break;
+        }
+        case 3:
+        {
+            data[0] = NRF_GPIO_PIN_MAP(0,16);
+            break;
+        }
+    }
+
+    const access_message_tx_t msg = {
+      .opcode = ACCESS_OPCODE_VENDOR(0xC2, 0xF001), // Build the normal Message, with the Opcode that the Receiver should execute
+      .p_buffer = &data,                           
+      .length = ARRAY_SIZE(data),
+      .force_segmented = false,
+      .transmic_size = NRF_MESH_TRANSMIC_SIZE_SMALL,
+      .access_token = nrf_mesh_unique_token_get()
+    };
+    
+    const access_reliable_t reliable_msg = {
+    .model_handle = mdl_hndl,                       // Build the reliable Message and define the Opcode that should be in the return
+    .message = msg,                                 // in this case 0xC3 which corresponds to the reply_handle function
+    .reply_opcode = ACCESS_OPCODE_VENDOR(0xC3, 0xF001),
+    .timeout = SEC_TO_US(5),                        // Timeout is set to 5s. Minimum is 2s and Maximum is 5s (i think)
+    .status_cb = my_status_cb                       // The Status Callback is called, either when an answer is received or the Timeout occured
+    };
+
+    nrf_gpio_pin_write(LED_1, false);
+
+    if(access_reliable_model_is_free(mdl_hndl))
+    {
+      status = access_model_reliable_publish(&reliable_msg); // Send the reliable Message
+      __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "\nSend Status is %d\nModel Handle is %04X\n", status, mdl_hndl);
+      if (status != NRF_SUCCESS)
+      {
+         nrf_gpio_pin_write(LED_2, false);
+      }
+    }
+}
+
+
+static void rtt_input_handler(int key)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Called: rtt_input_handler\n");
+    if (key >= '0' && key <= '3')
+    {
+        uint32_t button_number = key - '0';
+        button_event_handler(button_number);
+    }
+}
+
+static void publish_timeout_handle()
+{
+  
+}
+static void publish_interval_cb()
+{
+
+}
+// Model ###########################################################################################################
+static void status_handle(access_model_handle_t handle, const access_message_rx_t * p_rx_msg, void * p_args)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Called status_handle [Handle:%04X] \n", handle);
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "[Data:%02X] \n", p_rx_msg->p_data[0]);
+}
+
+static void reply_handle(access_model_handle_t handle, const access_message_rx_t * p_rx_msg, void * p_args)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Called reply_handle [Handle:%04X] \n", handle);
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "[Data:%02X] \n", p_rx_msg->p_data[0]);
+}
+
+static const access_opcode_handler_t m_opcode_handlers[] =
+{
+    {ACCESS_OPCODE_VENDOR(0xC1, 0xF001), status_handle}, // The Opcodes can be defined by you, but I think the two MSB have to be a 1 (0xC0 and above)
+    {ACCESS_OPCODE_VENDOR(0xC3, 0xF001), reply_handle},  // Company ID is 0xF001
+};
+
+static void models_init_cb(void)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Initializing and adding models\n");
+
+    access_model_add_params_t add_params =
+    {
+        .model_id = ACCESS_MODEL_VENDOR(0xFFAA, 0xF001),           // My Model ID is 0xFFAA and Company ID 0xF001
+        .element_index = 0,                                        // You can define these yourself, but I think the two MSB have to be a 1 (0xC000 and above)
+        .p_opcode_handlers = m_opcode_handlers,     
+        .opcode_count = ARRAY_SIZE(m_opcode_handlers),   
+        .p_args = NULL,                     
+        .publish_timeout_cb = publish_interval_cb                  // I don't really know what this function is used for...
+    };
+
+    uint32_t status = access_model_add(&add_params, &mdl_hndl);
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "\nInit Status is %d\nModel Handle is %04X\n", status, mdl_hndl);
+
+    if (status == NRF_SUCCESS)
+    {
+        status = access_model_subscription_list_alloc(mdl_hndl);
+        __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "\nAllocation Status is %d\nModel Handle is %04X\n", status, mdl_hndl);
+    }
+    else
+    {
+        nrf_gpio_pin_write(LED_2, false);
+    }
+    
+}
+// #####################################################################################################################
+
+static void mesh_init(void)
+{
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Called: mesh_init\n");
+    mesh_stack_init_params_t init_params =
+    {
+        .core.irq_priority       = NRF_MESH_IRQ_PRIORITY_LOWEST,
+        .core.lfclksrc           = DEV_BOARD_LF_CLK_CFG,
+        .core.p_uuid             = NULL,
+        .models.models_init_cb   = models_init_cb,          // Here is the Reference to the Model Init Function
+        .models.config_server_cb = config_server_evt_cb
+    };
+
+    ERROR_CHECK(mesh_stack_init(&init_params, &m_device_provisioned));
+}
+
+static void initialize(void)
+{
+    __LOG_INIT(LOG_SRC_APP | LOG_SRC_ACCESS | LOG_SRC_BEARER, LOG_LEVEL_INFO, LOG_CALLBACK_DEFAULT);
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "----- BLE Mesh Light Switch Client Demo -----\n");
+
+    ERROR_CHECK(app_timer_init());
+    hal_leds_init();
+
+#if BUTTON_BOARD
+    ERROR_CHECK(hal_buttons_init(button_event_handler));
+#endif
+    ble_stack_init();
+
+#if MESH_FEATURE_GATT_ENABLED
+    gap_params_init();
+    conn_params_init();
+#endif
+
+    mesh_init();
+}
+
+static void start(void)
+{
+    rtt_input_enable(rtt_input_handler, RTT_INPUT_POLL_PERIOD_MS);
+
+    if (!m_device_provisioned)
+    {
+        static const uint8_t static_auth_data[NRF_MESH_KEY_SIZE] = STATIC_AUTH_DATA;
+        mesh_provisionee_start_params_t prov_start_params =
+        {
+            .p_static_data    = static_auth_data,
+            .prov_complete_cb = provisioning_complete_cb,
+            .prov_device_identification_start_cb = device_identification_start_cb,
+            .prov_device_identification_stop_cb = NULL,
+            .prov_abort_cb = provisioning_aborted_cb,
+            .p_device_uri = EX_URI_LS_CLIENT
+        };
+        ERROR_CHECK(mesh_provisionee_prov_start(&prov_start_params));
+    }
+
+    mesh_app_uuid_print(nrf_mesh_configure_device_uuid_get());
+
+    ERROR_CHECK(mesh_stack_start());
+
+    hal_led_mask_set(LEDS_MASK, LED_MASK_STATE_OFF);
+    hal_led_blink_ms(LEDS_MASK, LED_BLINK_INTERVAL_MS, LED_BLINK_CNT_START);
+}
+
+int main(void)
+{
+    initialize();
+    start();
+
+    for (;;)
+    {
+        (void)sd_app_evt_wait();
+    }
+}
